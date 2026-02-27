@@ -1,0 +1,5 @@
+{
+  "name": "Content Authenticity Verifier",
+  "description": "A professional forensic platform to verify the authenticity of text, images, and videos, detecting AI-generated content, deepfakes, and social media misinformation.",
+  "requestFramePermissions": []
+}
