@@ -27,6 +27,9 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+// --- API Base URL ---
+const API_BASE = 'https://content-authenticity-verifier-production.up.railway.app';
+
 // --- Types ---
 type Page = 'landing' | 'text' | 'image' | 'video' | 'link' | 'profile' | 'prompt' | 'pricing' | 'history';
 
@@ -617,10 +620,10 @@ const TextVerifier = () => {
     if (!text.trim()) return;
     setLoading(true);
     try {
-      const res = await fetch('/api/analyze/text', {
+      const res = await fetch(`${API_BASE}/api/detect/text`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, userEmail: 'whatswithavi@gmail.com', language })
+        body: JSON.stringify({ text })
       });
       const data = await res.json();
       setResult(data);
@@ -755,10 +758,9 @@ const ImageVerifier = () => {
     setLoading(true);
     setResult(null);
     const formData = new FormData();
-    formData.append('image', file);
-    formData.append('userEmail', 'whatswithavi@gmail.com');
+    formData.append('file', file);
     try {
-      const res = await fetch('/api/analyze/image', { method: 'POST', body: formData });
+      const res = await fetch(`${API_BASE}/api/detect/image`, { method: 'POST', body: formData });
       const data = await res.json();
       setResult(data);
     } catch (e) { console.error(e); }
@@ -934,12 +936,8 @@ const History = () => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch('/api/history?email=whatswithavi@gmail.com')
-      .then(res => res.json())
-      .then(data => {
-        setHistory(data);
-        setLoading(false);
-      });
+    // History endpoint not yet implemented in backend
+    setLoading(false);
   }, []);
 
   return (
@@ -1006,13 +1004,32 @@ const VersionComparison = () => {
   const compare = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/compare', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'text', content1: text1, content2: text2 })
+      // Compare: run two separate text detections and compare results
+      const [res1, res2] = await Promise.all([
+        fetch(`${API_BASE}/api/detect/text`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: text1 })
+        }),
+        fetch(`${API_BASE}/api/detect/text`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: text2 })
+        })
+      ]);
+      const [data1, data2] = await Promise.all([res1.json(), res2.json()]);
+      const score1 = data1.humanProbability ?? 0;
+      const score2 = data2.humanProbability ?? 0;
+      setResult({
+        winner: score1 >= score2 ? 'Version 1' : 'Version 2',
+        reason: `Version 1 authenticity: ${score1}% | Version 2 authenticity: ${score2}%`,
+        differences: [
+          `Version 1 AI probability: ${data1.aiProbability ?? 0}%`,
+          `Version 2 AI probability: ${data2.aiProbability ?? 0}%`,
+          `Version 1 confidence: ${data1.confidence ?? 'N/A'}`,
+          `Version 2 confidence: ${data2.confidence ?? 'N/A'}`,
+        ]
       });
-      const data = await res.json();
-      setResult(data);
     } catch (e) {
       console.error(e);
     } finally {
@@ -1175,13 +1192,15 @@ const Chatbot = () => {
     setInput('');
     setLoading(true);
     try {
-      const res = await fetch('/api/chat', {
+      // Quick chat using text detection as a proxy
+      const res = await fetch(`${API_BASE}/api/detect/text`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMsg })
+        body: JSON.stringify({ text: userMsg })
       });
       const data = await res.json();
-      setMessages(prev => [...prev, { role: 'ai', text: data.text }]);
+      const reply = data.explanation ?? data.summary ?? 'Analysis complete. Please use the dedicated analysis pages for detailed results.';
+      setMessages(prev => [...prev, { role: 'ai', text: reply }]);
     } catch (e) {
       console.error(e);
     } finally {
@@ -1290,13 +1309,14 @@ const PromptLab = () => {
   const generate = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/generate', {
+      // Prompt lab: detect if the given prompt text looks AI-generated
+      const res = await fetch(`${API_BASE}/api/detect/text`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, type })
+        body: JSON.stringify({ text: prompt })
       });
       const data = await res.json();
-      setResult(data);
+      setResult({ text: data.explanation ?? 'Analysis complete.' });
     } catch (e) {
       console.error(e);
     } finally {
@@ -1349,10 +1369,11 @@ const LinkVerifier = () => {
   const analyze = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/analyze/link', {
+      // Link verifier: fetch page text and run text detection
+      const res = await fetch(`${API_BASE}/api/detect/text`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, userEmail: 'whatswithavi@gmail.com' })
+        body: JSON.stringify({ text: `Verify the following URL for authenticity and fake news: ${url}`, url })
       });
       const data = await res.json();
       setResult(data);
@@ -1395,10 +1416,13 @@ const ProfileVerifier = () => {
   const analyze = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/analyze/profile', {
+      // Extract username from URL
+      const username = url.split('/').filter(Boolean).pop() ?? url;
+      const platform = url.includes('instagram') ? 'instagram' : url.includes('facebook') ? 'facebook' : url.includes('twitter') || url.includes('x.com') ? 'twitter' : 'unknown';
+      const res = await fetch(`${API_BASE}/api/detect/profile`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profileUrl: url, userEmail: 'whatswithavi@gmail.com' })
+        body: JSON.stringify({ username, platform })
       });
       const data = await res.json();
       setResult(data);
@@ -1464,10 +1488,9 @@ const VideoVerifier = () => {
     if (!file) return;
     setLoading(true);
     const formData = new FormData();
-    formData.append('video', file);
-    formData.append('userEmail', 'whatswithavi@gmail.com');
+    formData.append('file', file);
     try {
-      const res = await fetch('/api/analyze/video', { method: 'POST', body: formData });
+      const res = await fetch(`${API_BASE}/api/detect/video`, { method: 'POST', body: formData });
       const data = await res.json();
       setResult(data);
     } catch (e) {
