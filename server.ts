@@ -37,10 +37,14 @@ async function startServer() {
   app.use(express.json({ limit: "10mb" }));
   const upload = multer({ storage: multer.memoryStorage() });
   const getAI = () => new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-  const MODEL = "gemini-2.5-flash-lite";
+  const MODEL = "gemini-1.5-flash";
 
   const isQuotaError = (e: any) =>
-    e?.status === 429 || String(e?.message || "").includes("429") || String(e?.message || "").includes("RESOURCE_EXHAUSTED");
+    e?.status === 429 || e?.status === 503 ||
+    String(e?.message || "").includes("429") ||
+    String(e?.message || "").includes("RESOURCE_EXHAUSTED") ||
+    String(e?.message || "").includes("UNAVAILABLE") ||
+    String(e?.message || "").includes("high demand");
 
   // ── Mock fallbacks ────────────────────────────────────────────────────────
   const mockTextResult = (text: string) => ({
@@ -301,7 +305,7 @@ Profile: ${profileUrl}`
   // Vite dev middleware
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, allowedHosts: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
