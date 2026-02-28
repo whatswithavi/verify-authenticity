@@ -28,7 +28,72 @@ function cn(...inputs: ClassValue[]) {
 }
 
 // --- API Base URL ---
-const API_BASE = 'https://content-authenticity-verifier-production.up.railway.app';
+// Empty string = same server (server.ts serves both frontend and API on port 3000)
+const API_BASE = '';
+
+// --- Response Normalizer ---
+// Backend returns: { trustScore, summary, confidence, verdict, details, flags }
+// Frontend expects: { humanProbability, aiProbability, explanation, confidence, ... }
+function normalizeResponse(data: any): any {
+  if (!data || data.verdict === 'ERROR') {
+    return {
+      humanProbability: 0,
+      aiProbability: 0,
+      confidence: 'Low',
+      explanation: data?.summary || 'Analysis failed. Please try again.',
+    };
+  }
+
+  const trustScore = data.trustScore ?? 50;
+  const aiProb = data.details?.aiGeneratedProbability ?? (100 - trustScore);
+  const humanProb = 100 - aiProb;
+
+  // Normalize confidence: "HIGH" → "High", "MEDIUM" → "Medium", "LOW" → "Low"
+  const confMap: Record<string, string> = { HIGH: 'High', MEDIUM: 'Medium', LOW: 'Low', NONE: 'Low' };
+  const confidence = confMap[data.confidence?.toUpperCase?.()] ?? data.confidence ?? 'Low';
+
+  // Build suspicious sections from flags
+  const suspiciousSections = (data.flags || []).map((flag: string) => ({
+    text: flag,
+    reason: flag,
+    severity: aiProb > 70 ? 'High' : aiProb > 40 ? 'Medium' : 'Low',
+  }));
+
+  // Build manipulated regions from image details
+  const manipulatedRegions = data.details?.visualArtifacts?.map((a: string) => ({
+    region: 'Detected Region',
+    issue: a,
+    severity: aiProb > 70 ? 'High' : 'Medium',
+  })) || [];
+
+  return {
+    humanProbability: humanProb,
+    aiProbability: aiProb,
+    confidence,
+    explanation: data.summary || '',
+    isFake: data.verdict === 'FAKE' || data.verdict === 'MANIPULATED',
+    isAIInfluencer: data.verdict === 'LIKELY_AI',
+    botProbability: aiProb,
+    redFlags: data.flags || [],
+    suspiciousSections: suspiciousSections.length > 0 ? suspiciousSections : undefined,
+    manipulatedRegions: manipulatedRegions.length > 0 ? manipulatedRegions : undefined,
+    plagiarism: data.details?.fakeNewsProbability != null ? {
+      isPlagiarized: data.details.fakeNewsProbability > 50,
+      sources: [],
+      score: data.details.fakeNewsProbability,
+    } : undefined,
+    credibility: data.details?.writingStyle ? {
+      rating: data.details.writingStyle === 'HUMAN' ? 'Trusted' : data.details.writingStyle === 'AI_LIKE' ? 'Risky' : 'Uncertain',
+      reason: `Writing style detected as: ${data.details.writingStyle}`,
+    } : undefined,
+    deepfakeSigns: data.details?.faceAnalysis && data.details.faceAnalysis !== 'NONE' && data.details.faceAnalysis !== 'AUTHENTIC'
+      ? [`Face analysis: ${data.details.faceAnalysis}`] : undefined,
+    watermarkDetected: false,
+    reverseSearch: undefined,
+    sourceRating: data.verdict,
+  };
+}
+
 
 // --- Types ---
 type Page = 'landing' | 'text' | 'image' | 'video' | 'link' | 'profile' | 'prompt' | 'pricing' | 'history';
@@ -620,10 +685,10 @@ const TextVerifier = () => {
     if (!text.trim()) return;
     setLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/api/detect/text`, {
+      const res = await fetch('/api/analyze/text', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text })
+        body: JSON.stringify({ text, userEmail: 'user@verify.app', language })
       });
       const data = await res.json();
       setResult(data);
@@ -708,17 +773,34 @@ const ImageVerifier = () => {
   const startCamera = async () => {
     setCameraError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
-      });
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.play();
+      // Try front camera first (works on laptops/desktops)
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+      } catch {
+        // Fallback: try any available camera with no constraints
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
       }
+      streamRef.current = stream;
+      // Set srcObject before marking active so the video element is mounted
       setCameraActive(true);
+      // Use a small delay to ensure the video element is in the DOM before assigning stream
+      setTimeout(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(() => { });
+        }
+      }, 100);
     } catch (e: any) {
-      setCameraError(e.name === 'NotAllowedError' ? 'Camera permission denied. Please allow access.' : 'Could not access camera: ' + e.message);
+      if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+        setCameraError('Camera permission denied. Please click the camera icon in your browser address bar and allow access, then try again.');
+      } else if (e.name === 'NotFoundError') {
+        setCameraError('No camera found on this device.');
+      } else {
+        setCameraError('Could not access camera: ' + e.message);
+      }
     }
   };
 
@@ -731,10 +813,15 @@ const ImageVerifier = () => {
   const capturePhoto = () => {
     const video = videoRef.current;
     if (!video) return;
+    // Use actual video dimensions, fallback to 1280x720 if not loaded yet
+    const w = video.videoWidth || 1280;
+    const h = video.videoHeight || 720;
     const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext('2d')!.drawImage(video, 0, 0);
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0, w, h);
     canvas.toBlob((blob) => {
       if (!blob) return;
       const captured = new File([blob], `capture-${Date.now()}.jpg`, { type: 'image/jpeg' });
@@ -758,9 +845,9 @@ const ImageVerifier = () => {
     setLoading(true);
     setResult(null);
     const formData = new FormData();
-    formData.append('file', file);
+    formData.append('image', file);
     try {
-      const res = await fetch(`${API_BASE}/api/detect/image`, { method: 'POST', body: formData });
+      const res = await fetch('/api/analyze/image', { method: 'POST', body: formData });
       const data = await res.json();
       setResult(data);
     } catch (e) { console.error(e); }
@@ -795,7 +882,17 @@ const ImageVerifier = () => {
             <div className="relative rounded-xl overflow-hidden bg-black aspect-video flex items-center justify-center">
               {cameraActive ? (
                 <>
-                  <video ref={videoRef} className="w-full h-full object-cover" autoPlay playsInline muted />
+                  <video
+                    ref={videoRef}
+                    className="w-full h-full object-cover"
+                    autoPlay
+                    playsInline
+                    muted
+                    onLoadedMetadata={(e) => {
+                      // Ensure video plays once metadata is loaded
+                      (e.target as HTMLVideoElement).play().catch(() => { });
+                    }}
+                  />
                   {/* Scanning overlay */}
                   <div className="absolute inset-0 pointer-events-none">
                     <div className="absolute inset-4 border-2 border-brand-primary/60 rounded-lg" />
@@ -1370,7 +1467,7 @@ const LinkVerifier = () => {
     setLoading(true);
     try {
       // Link verifier: fetch page text and run text detection
-      const res = await fetch(`${API_BASE}/api/detect/text`, {
+      const res = await fetch('/api/analyze/text', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: `Verify the following URL for authenticity and fake news: ${url}`, url })
@@ -1416,13 +1513,10 @@ const ProfileVerifier = () => {
   const analyze = async () => {
     setLoading(true);
     try {
-      // Extract username from URL
-      const username = url.split('/').filter(Boolean).pop() ?? url;
-      const platform = url.includes('instagram') ? 'instagram' : url.includes('facebook') ? 'facebook' : url.includes('twitter') || url.includes('x.com') ? 'twitter' : 'unknown';
-      const res = await fetch(`${API_BASE}/api/detect/profile`, {
+      const res = await fetch('/api/analyze/profile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, platform })
+        body: JSON.stringify({ profileUrl: url, userEmail: 'user@verify.app' })
       });
       const data = await res.json();
       setResult(data);
@@ -1488,9 +1582,10 @@ const VideoVerifier = () => {
     if (!file) return;
     setLoading(true);
     const formData = new FormData();
-    formData.append('file', file);
+    formData.append('video', file);
+    formData.append('userEmail', 'user@verify.app');
     try {
-      const res = await fetch(`${API_BASE}/api/detect/video`, { method: 'POST', body: formData });
+      const res = await fetch('/api/analyze/video', { method: 'POST', body: formData });
       const data = await res.json();
       setResult(data);
     } catch (e) {
